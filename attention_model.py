@@ -9,6 +9,9 @@ import torch
 import numpy as np
 from transformers import pipeline
 
+# Toggle to enable/disable debug prints
+DEBUG_ATTENTION_LOGS = True
+
 prompt = """
 You are an email classifier specialized in extracting a topic.
 You only respond with 1 topic without any chat-based fluff.
@@ -50,13 +53,13 @@ def load_model():
             # Robust device + dtype selection
             if torch.cuda.is_available():
                 target_device = "cuda"
-                target_dtype = torch.float16  # safer cross-GPU than bfloat16
             elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
                 target_device = "mps"
-                target_dtype = torch.float16
             else:
                 target_device = "cpu"
-                target_dtype = torch.float32
+
+            if DEBUG_ATTENTION_LOGS:
+                print(f"[load_model] Selecting pipeline on device={target_device}")
 
             # _pipeline = pipeline(
             #     "text-generation", 
@@ -94,7 +97,7 @@ def load_model():
             except Exception:
                 pass
             
-            print("✅ Successfully loaded google/gemma-3-1b-it via pipeline")
+            print("✅ Successfully loaded model via pipeline:", getattr(_pipeline, 'task', None), "| model:", _model.__class__.__name__)
             
         except Exception as e:
             print(f"❌ Error loading Gemma model: {e}")
@@ -200,15 +203,24 @@ def _mask_and_normalize_attentions(attentions, noise_mask: np.ndarray):
     masked = []
     # match dtype for numerical stability across devices
     eps = attentions[0].new_tensor(1e-12)
-    for att in attentions:
+    for layer_idx, att in enumerate(attentions):
         # Work in float32 to avoid low-precision degeneracy on CPU/MPS
         A = att.clone().to(dtype=torch.float32)  # [batch, heads, seq, seq]
+        if DEBUG_ATTENTION_LOGS:
+            with torch.no_grad():
+                m, M = float(A.min()), float(A.max())
+                print(f"[mask_norm] layer={layer_idx} pre-mask stats min={m:.6f} max={M:.6f}")
         # Zero out to and from masked tokens
         A[:, :, mask_t, :] = 0.0
         A[:, :, :, mask_t] = 0.0
         # Row-normalize per head
         row_sum = A.sum(dim=-1, keepdim=True) + eps
         A = A / row_sum
+        if DEBUG_ATTENTION_LOGS:
+            with torch.no_grad():
+                m, M = float(A.min()), float(A.max())
+                rs = A.sum(dim=-1).mean().item()
+                print(f"[mask_norm] layer={layer_idx} post-norm stats min={m:.6f} max={M:.6f} avg_row_sum={rs:.6f}")
         masked.append(A)
     return tuple(masked)
 
@@ -232,10 +244,16 @@ def compute_attention_rollout(attentions, decision_index: int = -1, noise_mask: 
     # Promote to float32 for stability if needed
     attentions_f32 = tuple(att.to(dtype=torch.float32) for att in attentions)
     a_tilde = _build_a_tilde(attentions_f32)
+    if DEBUG_ATTENTION_LOGS:
+        print(f"[rollout] num_layers={len(a_tilde)} seq_len={a_tilde[0].shape[-1] if a_tilde else 0}")
     # Rollout from bottom to top
     R = a_tilde[0]
     for layer_idx in range(1, len(a_tilde)):
         R = torch.matmul(R, a_tilde[layer_idx])
+        if DEBUG_ATTENTION_LOGS and layer_idx % max(1, len(a_tilde)//4) == 0:
+            with torch.no_grad():
+                m, M = float(R.min()), float(R.max())
+                print(f"[rollout] after layer {layer_idx} stats min={m:.6f} max={M:.6f}")
     # Decision token: typically the last token in decoder-only models
     # Decision token row (e.g., -1 for decoder, 0 for encoder [CLS])
     decision_row = R[decision_index]
@@ -246,6 +264,8 @@ def compute_attention_rollout(attentions, decision_index: int = -1, noise_mask: 
         scores = (scores - min_s) / (max_s - min_s)
     else:
         scores = np.full_like(scores, 0.5)
+    if DEBUG_ATTENTION_LOGS:
+        print(f"[rollout] decision_index={decision_index} min={min_s:.6f} max={max_s:.6f} normalized_min={scores.min():.6f} normalized_max={scores.max():.6f}")
     return scores
 
 
@@ -301,6 +321,13 @@ def extract_attention_scores(model, tokenizer, text, decision_index: int = -1):
     
     # Extract attention weights
     attentions = outputs.attentions  # Tuple of attention tensors for each layer
+    if DEBUG_ATTENTION_LOGS and attentions is not None:
+        try:
+            num_layers = len(attentions)
+            b, h, s1, s2 = attentions[0].shape
+            print(f"[extract] attentions: layers={num_layers} batch={b} heads={h} seq={s1}")
+        except Exception:
+            pass
     
     if attentions is None:
         # For models that ignore output_attentions unless set on config, try one more time
@@ -347,6 +374,11 @@ def extract_attention_scores(model, tokenizer, text, decision_index: int = -1):
     # Compute three variants with masking
     avg_scores = compute_attention_layer_average(attentions, decision_index=decision_index, noise_mask=noise_mask)
     rollout_scores = compute_attention_rollout(attentions, decision_index=decision_index, noise_mask=noise_mask)
+    if DEBUG_ATTENTION_LOGS:
+        try:
+            print(f"[extract] scores stats avg(min={float(avg_scores.min()):.4f} max={float(avg_scores.max()):.4f}) rollout(min={float(rollout_scores.min()):.4f} max={float(rollout_scores.max()):.4f})")
+        except Exception:
+            pass
     
     # Return raw per-token scores aligned with offsets (no filtering)
     return offsets, {
@@ -470,7 +502,9 @@ def predict_sentiment_with_distribution(text):
             # Also provide raw generation to be shown in UI
             try:
                 gen = _pipeline(formatted_prompt, max_new_tokens=8, do_sample=False)
-                raw_output = gen[0].get('generated_text', '')
+                raw_out = gen[0].get('generated_text', '')
+                # Trim the prompt prefix so UI shows only the model's continuation
+                raw_output = raw_out[len(formatted_prompt):].strip() if raw_out.startswith(formatted_prompt) else raw_out
             except Exception:
                 raw_output = ''
             return predicted_sentiment, {**prob_dict, '_raw_output': raw_output, '_prompt': formatted_prompt}
@@ -571,6 +605,8 @@ def get_attention(text):
             token_indices = list(range(len(offsets)))
             email_start = 0
             email_end = len(formatted_prompt)
+        if DEBUG_ATTENTION_LOGS:
+            print(f"[get_attention] total_tokens={len(offsets)} email_tokens={len(token_indices)} email_span=({email_start},{email_end}) decision_index={decision_index}")
 
         # Clip token offsets to the email substring coordinates
         clipped_offsets = [(max(a - email_start, 0), max(min(b, email_end) - email_start, 0)) for i, (a, b) in enumerate(offsets) if i in token_indices]
@@ -582,6 +618,13 @@ def get_attention(text):
             'layer_average': take(token_scores_dict['layer_average']),
             'rollout': take(token_scores_dict['rollout']),
         }
+        if DEBUG_ATTENTION_LOGS:
+            try:
+                la = np.array(token_scores_email['layer_average'])
+                ro = np.array(token_scores_email['rollout'])
+                print(f"[get_attention] email token score stats layer_avg(min={la.min():.4f} max={la.max():.4f}) rollout(min={ro.min():.4f} max={ro.max():.4f})")
+            except Exception:
+                pass
 
         # Build per-sentence aggregation over the email text
         email_text_only = formatted_prompt[email_start:email_end]
@@ -612,6 +655,11 @@ def get_attention(text):
             'layer_average': aggregate_by_spans(sentence_spans, clipped_offsets, token_scores_email['layer_average']),
             'rollout': aggregate_by_spans(sentence_spans, clipped_offsets, token_scores_email['rollout']),
         }
+        if DEBUG_ATTENTION_LOGS:
+            try:
+                print(f"[get_attention] sentences={len(sentence_spans)} first_span={sentence_spans[0] if sentence_spans else None}")
+            except Exception:
+                pass
 
         # Also compute word-level aggregation for backward compatibility in UI (using proper offsets)
         # Build word spans
@@ -630,6 +678,23 @@ def get_attention(text):
             'layer_average': [0.5] * len(words),
             'rollout': [0.5] * len(words),
         }
+
+        if DEBUG_ATTENTION_LOGS:
+            # Preview top tokens by rollout and layer avg
+            try:
+                def preview_top(scores, name):
+                    arr = list(enumerate(scores))
+                    arr.sort(key=lambda t: t[1], reverse=True)
+                    top = arr[:10]
+                    toks = []
+                    for idx, val in top:
+                        a, b = clipped_offsets[idx]
+                        toks.append((email_text_only[a:b], float(val)))
+                    print(f"[top_tokens] {name}:", ", ".join([f"{t[0]}({t[1]:.2f})" for t in toks]))
+                preview_top(token_scores_email['rollout'], 'rollout')
+                preview_top(token_scores_email['layer_average'], 'layer_avg')
+            except Exception:
+                pass
 
         return {
             'attention_scores': {
