@@ -208,6 +208,8 @@ def main():
             # Display prediction distribution
             sentiment = result_data.get('sentiment', 'Unknown')
             probabilities = result_data.get('probabilities', {})
+            raw_output = result_data.get('raw_model_output', '')
+            used_prompt = result_data.get('used_prompt', '')
             if probabilities:
                 st.subheader("📊 Prediction Distribution")
                 st.write("Model's confidence for each sentiment category:")
@@ -237,6 +239,14 @@ def main():
                                 </div>
                             </div>
                         ''', unsafe_allow_html=True)
+
+            # Show raw model output and the prompt used
+            if raw_output:
+                st.subheader("🧪 Raw model output")
+                st.code(raw_output, language="text")
+            if used_prompt:
+                with st.expander("Show used prompt"):
+                    st.code(used_prompt, language="text")
 
             # Display token/sentence attention with correct mapping
             token_att = result_data.get('token_attention')

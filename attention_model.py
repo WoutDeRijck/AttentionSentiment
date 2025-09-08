@@ -58,26 +58,32 @@ def load_model():
                 target_device = "cpu"
                 target_dtype = torch.float32
 
-            _pipeline = pipeline(
-                "text-generation", 
-                # model="google/gemma-3-1b-it",
-                model="meta-llama/Llama-3.2-1B",
-                device=target_device,
-                dtype=target_dtype,
-                model_kwargs={"attn_implementation": "eager"}  # Force eager attention for output_attentions
-            )
-
             # _pipeline = pipeline(
-            #     "text-classification",
-            #     model="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
-            #     device="cuda" if torch.cuda.is_available() else "cpu",
-            #     dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            #     "text-generation", 
+            #     # model="google/gemma-3-1b-it",
+            #     model="meta-llama/Llama-3.2-1B",
+            #     device=target_device,
+            #     torch_dtype=target_dtype,
             #     model_kwargs={"attn_implementation": "eager"}  # Force eager attention for output_attentions
             # )
+
+            _pipeline = pipeline(
+                "text-classification",
+                model="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+                device=target_device,
+                model_kwargs={"attn_implementation": "eager"}  # Force eager attention for output_attentions
+            )
             
             # Extract model and tokenizer from pipeline
             _model = _pipeline.model
             _tokenizer = _pipeline.tokenizer
+            try:
+                _model.eval()
+                # Ensure safe dtype on CPU
+                if target_device == "cpu":
+                    _model.to(torch.float32)
+            except Exception:
+                pass
             
             # Add padding token if it doesn't exist
             if _tokenizer.pad_token is None:
@@ -109,6 +115,12 @@ def load_model():
                 )
                 _model = _pipeline.model
                 _tokenizer = _pipeline.tokenizer
+                try:
+                    _model.eval()
+                    if target_device == "cpu":
+                        _model.to(torch.float32)
+                except Exception:
+                    pass
                 
                 if _tokenizer.pad_token is None:
                     _tokenizer.pad_token = _tokenizer.eos_token
@@ -189,7 +201,8 @@ def _mask_and_normalize_attentions(attentions, noise_mask: np.ndarray):
     # match dtype for numerical stability across devices
     eps = attentions[0].new_tensor(1e-12)
     for att in attentions:
-        A = att.clone()  # [batch, heads, seq, seq]
+        # Work in float32 to avoid low-precision degeneracy on CPU/MPS
+        A = att.clone().to(dtype=torch.float32)  # [batch, heads, seq, seq]
         # Zero out to and from masked tokens
         A[:, :, mask_t, :] = 0.0
         A[:, :, :, mask_t] = 0.0
@@ -216,7 +229,9 @@ def compute_attention_rollout(attentions, decision_index: int = -1, noise_mask: 
     # Use the first (and only) item in batch
     if noise_mask is not None:
         attentions = _mask_and_normalize_attentions(attentions, noise_mask)
-    a_tilde = _build_a_tilde(attentions)
+    # Promote to float32 for stability if needed
+    attentions_f32 = tuple(att.to(dtype=torch.float32) for att in attentions)
+    a_tilde = _build_a_tilde(attentions_f32)
     # Rollout from bottom to top
     R = a_tilde[0]
     for layer_idx in range(1, len(a_tilde)):
@@ -452,7 +467,13 @@ def predict_sentiment_with_distribution(text):
                 'Neutral': probabilities[2].item()
             }
             predicted_sentiment = max(prob_dict, key=prob_dict.get)
-            return predicted_sentiment, prob_dict
+            # Also provide raw generation to be shown in UI
+            try:
+                gen = _pipeline(formatted_prompt, max_new_tokens=8, do_sample=False)
+                raw_output = gen[0].get('generated_text', '')
+            except Exception:
+                raw_output = ''
+            return predicted_sentiment, {**prob_dict, '_raw_output': raw_output, '_prompt': formatted_prompt}
         
     except Exception as e:
         print(f"Error in sentiment prediction with distribution: {e}")
@@ -478,11 +499,11 @@ def predict_sentiment_with_distribution(text):
                 if key != predicted:
                     prob_dict[key] = remaining
                     
-            return predicted, prob_dict
+            return predicted, {**prob_dict, '_raw_output': generated_text, '_prompt': formatted_prompt}
             
         except Exception as e2:
             print(f"Fallback also failed: {e2}")
-            return 'Neutral', {'Positive': 0.33, 'Negative': 0.33, 'Neutral': 0.34}
+            return 'Neutral', {'Positive': 0.33, 'Negative': 0.33, 'Neutral': 0.34, '_raw_output': '', '_prompt': ''}
 
 
 def predict_sentiment(text):
@@ -629,7 +650,9 @@ def get_attention(text):
             },
             'sentiment': sentiment_prediction,
             'probabilities': probabilities,
-            'confidence': max(probabilities.values())
+            'confidence': max(v for k, v in probabilities.items() if not k.startswith('_')),
+            'raw_model_output': probabilities.get('_raw_output', ''),
+            'used_prompt': probabilities.get('_prompt', ''),
         }
         
     except Exception as e:
