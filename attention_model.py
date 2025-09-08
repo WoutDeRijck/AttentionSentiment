@@ -47,12 +47,23 @@ def load_model():
     if _model is None or _tokenizer is None:
         try:
             # Create the pipeline first with eager attention for output_attentions support
+            # Robust device + dtype selection
+            if torch.cuda.is_available():
+                target_device = "cuda"
+                target_dtype = torch.float16  # safer cross-GPU than bfloat16
+            elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+                target_device = "mps"
+                target_dtype = torch.float16
+            else:
+                target_device = "cpu"
+                target_dtype = torch.float32
+
             _pipeline = pipeline(
                 "text-generation", 
                 # model="google/gemma-3-1b-it",
                 model="meta-llama/Llama-3.2-1B",
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+                device=target_device,
+                dtype=target_dtype,
                 model_kwargs={"attn_implementation": "eager"}  # Force eager attention for output_attentions
             )
 
@@ -83,10 +94,17 @@ def load_model():
             print(f"❌ Error loading Gemma model: {e}")
             # Fallback to a smaller model if Gemma fails
             try:
+                # Reuse the same robust device setup for fallback
+                if torch.cuda.is_available():
+                    target_device = "cuda"
+                elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+                    target_device = "mps"
+                else:
+                    target_device = "cpu"
                 _pipeline = pipeline(
                     "text-generation",
                     model="distilgpt2",
-                    device="cuda" if torch.cuda.is_available() else "cpu",
+                    device=target_device,
                     model_kwargs={"attn_implementation": "eager"}  # Force eager attention for fallback too
                 )
                 _model = _pipeline.model
@@ -134,7 +152,8 @@ def _row_normalize(matrix: torch.Tensor) -> torch.Tensor:
     Returns:
         Tensor of shape [seq_len, seq_len]
     """
-    row_sum = matrix.sum(dim=-1, keepdim=True) + 1e-12
+    eps = matrix.new_tensor(1e-12)
+    row_sum = matrix.sum(dim=-1, keepdim=True) + eps
     return matrix / row_sum
 
 
@@ -147,7 +166,7 @@ def _build_a_tilde(attentions):
     a_tilde = []
     for A in layer_mats:
         seq_len = A.size(-1)
-        A_res = A + torch.eye(seq_len, device=device)
+        A_res = A + torch.eye(seq_len, device=device, dtype=A.dtype)
         a_tilde.append(_row_normalize(A_res))
     return a_tilde
 
@@ -167,7 +186,8 @@ def _mask_and_normalize_attentions(attentions, noise_mask: np.ndarray):
     device = attentions[0].device
     mask_t = torch.from_numpy(noise_mask.astype(np.bool_)).to(device)
     masked = []
-    eps = 1e-12
+    # match dtype for numerical stability across devices
+    eps = attentions[0].new_tensor(1e-12)
     for att in attentions:
         A = att.clone()  # [batch, heads, seq, seq]
         # Zero out to and from masked tokens
