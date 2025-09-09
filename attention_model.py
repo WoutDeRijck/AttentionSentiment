@@ -136,6 +136,22 @@ def load_model():
     return _model, _tokenizer
 
 
+def _take_first_word(text: str) -> str:
+    """Return the first word-like token from text (letters/numbers), stripped of punctuation."""
+    if not text:
+        return ""
+    parts = text.strip().split()
+    if not parts:
+        return ""
+    token = parts[0]
+    try:
+        import re
+        token = re.sub(r"^[^\w]+|[^\w]+$", "", token)
+    except Exception:
+        pass
+    return token
+
+
 def tokenize_text(text, tokenizer):
     """
     Tokenize the input text using the model's tokenizer.
@@ -182,7 +198,18 @@ def _build_a_tilde(attentions):
     for A in layer_mats:
         seq_len = A.size(-1)
         A_res = A + torch.eye(seq_len, device=device, dtype=A.dtype)
-        a_tilde.append(_row_normalize(A_res))
+        A_tilde = _row_normalize(A_res)
+        if DEBUG_ATTENTION_LOGS:
+            with torch.no_grad():
+                try:
+                    rs_min = float(A_tilde.sum(dim=-1).min())
+                    rs_max = float(A_tilde.sum(dim=-1).max())
+                    a_min = float(A_tilde.min())
+                    a_max = float(A_tilde.max())
+                    print(f"[_build_a_tilde] seq_len={seq_len} row_sum_min={rs_min:.6f} row_sum_max={rs_max:.6f} val_min={a_min:.6f} val_max={a_max:.6f}")
+                except Exception:
+                    pass
+        a_tilde.append(A_tilde)
     return a_tilde
 
 
@@ -281,6 +308,11 @@ def compute_attention_layer_average(attentions, decision_index: int = -1, noise_
     # Decision token row (e.g., -1 for decoder, 0 for encoder [CLS])
     decision_row = M[decision_index]
     scores = decision_row.detach().cpu().numpy()
+    if DEBUG_ATTENTION_LOGS:
+        try:
+            print(f"[layer_avg] decision_index={decision_index} row_min={float(scores.min()):.6f} row_max={float(scores.max()):.6f}")
+        except Exception:
+            pass
     min_s, max_s = scores.min(), scores.max()
     if max_s > min_s:
         scores = (scores - min_s) / (max_s - min_s)
@@ -310,6 +342,13 @@ def extract_attention_scores(model, tokenizer, text, decision_index: int = -1):
     enc = tokenizer(text, return_offsets_mapping=True, add_special_tokens=True)
     offsets = enc["offset_mapping"]  # list of (start, end)
     input_ids = enc.get("input_ids", [])
+    if DEBUG_ATTENTION_LOGS:
+        try:
+            model_type = getattr(model.config, 'model_type', 'unknown')
+            device_name = str(next(model.parameters()).device)
+            print(f"[extract] model={model.__class__.__name__} type={model_type} device={device_name} tokens={len(input_ids)}")
+        except Exception:
+            pass
     
     # Move inputs to the same device as model
     device = next(model.parameters()).device
@@ -363,6 +402,14 @@ def extract_attention_scores(model, tokenizer, text, decision_index: int = -1):
         (dt.startswith('[') and dt.endswith(']')) or (dt.startswith('<') and dt.endswith('>')) or is_noise(dt)
         for dt in decoded_tokens
     ], dtype=np.bool_)
+    if DEBUG_ATTENTION_LOGS:
+        try:
+            masked_cnt = int(noise_mask.sum())
+            print(f"[extract] initial noise mask active tokens={len(noise_mask)-masked_cnt}/{len(noise_mask)} masked={masked_cnt}")
+            preview = [dt.replace("\n","\\n") for dt in decoded_tokens[:30]]
+            print("[extract] first 30 tokens:", " | ".join(preview))
+        except Exception:
+            pass
     # Never mask the decision token and ensure we keep useful tokens
     if 0 <= (decision_index if decision_index >= 0 else len(decoded_tokens) + decision_index) < len(decoded_tokens):
         idx = decision_index if decision_index >= 0 else len(decoded_tokens) + decision_index
@@ -370,6 +417,8 @@ def extract_attention_scores(model, tokenizer, text, decision_index: int = -1):
     # If masking removes almost everything, disable masking to avoid degenerate 0.5 outputs
     if (np.sum(~noise_mask) < max(2, int(0.1 * len(noise_mask)))):
         noise_mask = None
+        if DEBUG_ATTENTION_LOGS:
+            print("[extract] disabled noise mask due to excessive masking")
 
     # Compute three variants with masking
     avg_scores = compute_attention_layer_average(attentions, decision_index=decision_index, noise_mask=noise_mask)
@@ -505,6 +554,8 @@ def predict_sentiment_with_distribution(text):
                 raw_out = gen[0].get('generated_text', '')
                 # Trim the prompt prefix so UI shows only the model's continuation
                 raw_output = raw_out[len(formatted_prompt):].strip() if raw_out.startswith(formatted_prompt) else raw_out
+                # Only keep the first word as requested
+                raw_output = _take_first_word(raw_output)
             except Exception:
                 raw_output = ''
             return predicted_sentiment, {**prob_dict, '_raw_output': raw_output, '_prompt': formatted_prompt}
@@ -513,14 +564,17 @@ def predict_sentiment_with_distribution(text):
         print(f"Error in sentiment prediction with distribution: {e}")
         # Fallback to simple generation
         try:
-            response = _pipeline(formatted_prompt, max_new_tokens=10, do_sample=False)
+            formatted_prompt_local = prompt.format(text=text)
+            response = _pipeline(formatted_prompt_local, max_new_tokens=10, do_sample=False)
             generated_text = response[0]['generated_text']
-            sentiment_prediction = generated_text[len(formatted_prompt):].strip()
-            sentiment_prediction = sentiment_prediction.split('\n')[0].strip()
+            sentiment_prediction = generated_text[len(formatted_prompt_local):].strip()
+            # Take only the first line and then the first word
+            first_line = sentiment_prediction.split('\n', 1)[0].strip()
+            sentiment_first = _take_first_word(first_line)
             
-            if 'Negative' in sentiment_prediction:
+            if 'Negative' in sentiment_first:
                 predicted = 'Negative'
-            elif 'Positive' in sentiment_prediction:
+            elif 'Positive' in sentiment_first:
                 predicted = 'Positive'
             else:
                 predicted = 'Neutral'
@@ -533,7 +587,7 @@ def predict_sentiment_with_distribution(text):
                 if key != predicted:
                     prob_dict[key] = remaining
                     
-            return predicted, {**prob_dict, '_raw_output': generated_text, '_prompt': formatted_prompt}
+            return predicted, {**prob_dict, '_raw_output': sentiment_first, '_prompt': formatted_prompt_local}
             
         except Exception as e2:
             print(f"Fallback also failed: {e2}")
