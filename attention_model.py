@@ -11,25 +11,38 @@ from transformers import pipeline
 
 # Toggle to enable/disable debug prints
 DEBUG_ATTENTION_LOGS = True
+ 
 
 prompt = """
-You are an email classifier specialized in extracting a topic.
-You only respond with 1 topic without any chat-based fluff.
+You are an email classifier. Respond with EXACTLY one of the label identifiers below, with no extra words.
 
 I have the following email:
 
 {text}
 
-Categorize the email in one of the following categories, pick the most specific one:
-Negative(Negative)
-Negative sentiment expressed in this email, customer is not happy. Only use if strong negative sentiment is expressed. This option should only be picked if there is a strong negative sentiment. IGNORE THE SEVERITY AND THE WORDS LIKE ONGOING IMPACT Ignore html tags.
-Neutral(Neutral)
-Default option, formal or no strong expression of positive/negative feelings. Should be picked most of the time as this is the default.
-Positive(Positive)
-Positive sentiment expressed in this email, customer expresses happy / good feelings. Should be picked when customer expresses clear positive signals.
+Classify the email into ONE of these categories (respond with the identifier in parentheses only):
 
-Make sure to only respond with 1 topic that is the best fitting.
-Say nothing else. For example, do not say: 'Here is the topic.' or "Topic:".
+Attention needed(Attention_needed)
+ONLY select when the customer explicitly uses escalation language:
+- Contains words: "urgent", "escalate", "emergency", "immediate attention required", "customers affected"
+- Customer demands management involvement
+- Uses phrases like "need to escalate this", "urgent request", "emergency priority"
+DO NOT select based on:
+- Technical severity words (crash, down, failure, critical error, slow, broken)
+- Impact descriptions (systems affected, outages, performance issues)
+Technical problems (even severe ones like "engine crash", "system down", "critical failure") should be "Default" unless customer explicitly requests escalation.
+
+Default(Default)
+Use for all standard technical issues and requests, including:
+- System crashes, failures, outages, performance problems
+- Any severity level (Minor/Major) without explicit escalation language
+- Technical emergencies described without escalation requests
+Select this unless customer explicitly uses escalation language like "urgent", "escalate", "emergency priority".
+
+Escalate(Escalate)
+Really rare, should be escalated to management. Highest level of escalation possible. Use only when the customer or we explicitly escalate or request escalation at the highest level.
+
+Respond with only one identifier: Attention_needed, Default, or Escalate. Say nothing else.
 """
 
 
@@ -61,21 +74,20 @@ def load_model():
             if DEBUG_ATTENTION_LOGS:
                 print(f"[load_model] Selecting pipeline on device={target_device}")
 
-            # _pipeline = pipeline(
-            #     "text-generation", 
-            #     # model="google/gemma-3-1b-it",
-            #     model="meta-llama/Llama-3.2-1B",
-            #     device=target_device,
-            #     torch_dtype=target_dtype,
-            #     model_kwargs={"attn_implementation": "eager"}  # Force eager attention for output_attentions
-            # )
-
             _pipeline = pipeline(
-                "text-classification",
-                model="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+                "text-generation", 
+                # model="google/gemma-3-1b-it",
+                model="meta-llama/Llama-3.1-8B-Instruct",
                 device=target_device,
                 model_kwargs={"attn_implementation": "eager"}  # Force eager attention for output_attentions
             )
+
+            # _pipeline = pipeline(
+            #     "text-classification",
+            #     model="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+            #     device=target_device,
+            #     model_kwargs={"attn_implementation": "eager"}  # Force eager attention for output_attentions
+            # )
             
             # Extract model and tokenizer from pipeline
             _model = _pipeline.model
@@ -303,11 +315,23 @@ def compute_attention_layer_average(attentions, decision_index: int = -1, noise_
     # Average heads per layer on raw attentions (no residual, no row-normalization)
     if noise_mask is not None:
         attentions = _mask_and_normalize_attentions(attentions, noise_mask)
-    layer_mats = [att[0].mean(dim=0) for att in attentions]  # list of [seq, seq]
-    M = torch.stack(layer_mats, dim=0).mean(dim=0)  # [seq, seq]
+    # Promote to float32 for numerical stability and to avoid unsupported bf16 ops
+    attentions_f32 = tuple(att.to(dtype=torch.float32) for att in attentions)
+    layer_mats = [att[0].mean(dim=0) for att in attentions_f32]  # list of [seq, seq]
+    # Weight later layers more heavily for better decision attribution in decoder LMs
+    try:
+        L = len(layer_mats)
+        weights = torch.linspace(0.5, 1.5, steps=L, device=layer_mats[0].device, dtype=layer_mats[0].dtype)
+        weights = weights / weights.sum()
+        stacked = torch.stack(layer_mats, dim=0)
+        M = (stacked * weights.view(L, 1, 1)).sum(dim=0)
+        if DEBUG_ATTENTION_LOGS:
+            print(f"[layer_avg] layer_weights first={float(weights[0]):.4f} last={float(weights[-1]):.4f}")
+    except Exception:
+        M = torch.stack(layer_mats, dim=0).mean(dim=0)  # fallback uniform
     # Decision token row (e.g., -1 for decoder, 0 for encoder [CLS])
-    decision_row = M[decision_index]
-    scores = decision_row.detach().cpu().numpy()
+    decision_row = M[decision_index].detach().cpu().numpy()
+    scores = decision_row
     if DEBUG_ATTENTION_LOGS:
         try:
             print(f"[layer_avg] decision_index={decision_index} row_min={float(scores.min()):.6f} row_max={float(scores.max()):.6f}")
@@ -436,6 +460,120 @@ def extract_attention_scores(model, tokenizer, text, decision_index: int = -1):
     }
 
 
+def extract_generated_label_attention(model, tokenizer, formatted_prompt: str, email_start: int, email_end: int):
+    """
+    For decoder-only models: run 1-step generation with attentions and use the
+    generated token's attention row to score the context tokens.
+
+    Returns (offsets, scores_dict) where offsets are for the input tokens only.
+    """
+    # Tokenize twice to get tensors and offsets
+    inputs = tokenizer(formatted_prompt, return_tensors="pt")
+    enc = tokenizer(formatted_prompt, return_offsets_mapping=True, add_special_tokens=True)
+    offsets = enc.get("offset_mapping", [])
+    device = next(model.parameters()).device
+    inputs = inputs.to(device)
+    # Ensure we have a pad token id to avoid warnings
+    pad_id = getattr(tokenizer, 'pad_token_id', None)
+    if pad_id is None:
+        try:
+            tokenizer.pad_token = tokenizer.eos_token
+            pad_id = tokenizer.eos_token_id
+        except Exception:
+            pass
+    # Generate a single token with attentions
+    gen_kwargs = {
+        'max_new_tokens': 1,
+        'do_sample': False,
+        'output_attentions': True,
+        'return_dict_in_generate': True,
+    }
+    if pad_id is not None:
+        gen_kwargs['pad_token_id'] = pad_id
+    with torch.no_grad():
+        gen_out = model.generate(**inputs, **gen_kwargs)
+    # Debug: decode generated label token
+    try:
+        last_tok_id = int(gen_out.sequences[0, -1].item())
+        label_tok_text = tokenizer.decode([last_tok_id])
+        if DEBUG_ATTENTION_LOGS:
+            print(f"[generated_label] id={last_tok_id} text='{label_tok_text}'")
+    except Exception:
+        label_tok_text = ''
+    # gen_out.attentions: list length T (1). Each item: tuple of layers with [b,h,seq,seq]
+    step_atts = tuple(att.to(dtype=torch.float32) for att in gen_out.attentions[0])
+    # Use our existing computations with decision_index = -1 (the generated position)
+    avg_scores = compute_attention_layer_average(step_atts, decision_index=-1, noise_mask=None)
+    rollout_scores = compute_attention_rollout(step_atts, decision_index=-1, noise_mask=None)
+    # Select email token indices from offsets
+    token_indices = [i for i, (a, b) in enumerate(offsets) if not (b <= email_start or a >= email_end)]
+    if not token_indices:
+        token_indices = list(range(len(offsets)))
+    # Build decoded token texts for selected tokens
+    try:
+        ids_all = enc.get('input_ids', [])
+        toks_all = [tokenizer.decode([tid]) if isinstance(tid, int) else '' for tid in ids_all]
+        toks_sel = [toks_all[i] for i in token_indices]
+    except Exception:
+        toks_sel = []
+    def take(arr):
+        return [arr[i] for i in token_indices]
+    scores_dict = {
+        'layer_average': [float(x) for x in take(avg_scores)],
+        'rollout': [float(x) for x in take(rollout_scores)],
+        '_tokens': toks_sel,
+        '_generated_label_token': label_tok_text,
+    }
+    # Clip offsets to email span for rendering
+    clipped_offsets = [(max(a - email_start, 0), max(min(b, email_end) - email_start, 0)) for i, (a, b) in enumerate(offsets) if i in token_indices]
+    return clipped_offsets, scores_dict
+
+
+def extract_forced_label_attention(model, tokenizer, formatted_prompt: str, label_text: str, email_start: int, email_end: int):
+    """
+    Decoder-only: append the chosen label (e.g., " Positive") to the prompt, run a
+    single forward pass with output_attentions, and use the appended label token's
+    attention row to score the original prompt tokens only.
+    """
+    device = next(model.parameters()).device
+    # Offsets for prompt-only tokens
+    enc_prompt = tokenizer(formatted_prompt, return_offsets_mapping=True, add_special_tokens=True)
+    prompt_offsets = enc_prompt.get("offset_mapping", [])
+    num_prompt_tokens = len(prompt_offsets)
+    # Build combined input with label appended (ensure leading space)
+    label_str = (" " + label_text.strip()) if not label_text.startswith(" ") else label_text
+    combined_text = formatted_prompt + label_str
+    inputs = tokenizer(combined_text, return_tensors="pt")
+    inputs = inputs.to(device)
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True)
+    attentions = tuple(att.to(dtype=torch.float32) for att in outputs.attentions)
+    # Aggregate per standard method
+    avg_scores_full = compute_attention_layer_average(attentions, decision_index=-1, noise_mask=None)
+    rollout_scores_full = compute_attention_rollout(attentions, decision_index=-1, noise_mask=None)
+    # Keep only the columns corresponding to the original prompt tokens
+    avg_scores = avg_scores_full[:num_prompt_tokens]
+    rollout_scores = rollout_scores_full[:num_prompt_tokens]
+    # Select prompt token indices overlapping the email substring
+    token_indices = [i for i, (a, b) in enumerate(prompt_offsets) if not (b <= email_start or a >= email_end)]
+    if not token_indices:
+        token_indices = list(range(len(prompt_offsets)))
+    def take(arr):
+        return [arr[i] for i in token_indices]
+    scores_dict = {
+        'layer_average': [float(x) for x in take(avg_scores)],
+        'rollout': [float(x) for x in take(rollout_scores)],
+        '_generated_label_token': label_text,
+    }
+    clipped_offsets = [(max(a - email_start, 0), max(min(b, email_end) - email_start, 0)) for i, (a, b) in enumerate(prompt_offsets) if i in token_indices]
+    if DEBUG_ATTENTION_LOGS:
+        try:
+            print(f"[forced_label] using label='{label_text}' and slicing to prompt tokens: {num_prompt_tokens}")
+        except Exception:
+            pass
+    return clipped_offsets, scores_dict
+
+
 def align_tokens_with_words(text, tokens, attention_scores):
     """
     Align subword tokens back to original words and aggregate attention scores.
@@ -478,13 +616,9 @@ def align_tokens_with_words(text, tokens, attention_scores):
 
 def predict_sentiment_with_distribution(text):
     """
-    Predict sentiment using the Gemma model and get the probability distribution.
-    
-    Args:
-        text (str): The input email text to analyze
-        
-    Returns:
-        tuple: (predicted_sentiment, probability_distribution)
+    General classification: compute probabilities over labels
+    [Attention_needed, Default, Escalate] using a decoder LM.
+    Returns (predicted_label, probability_dict).
     """
     try:
         # Use the pipeline for text generation
@@ -497,71 +631,37 @@ def predict_sentiment_with_distribution(text):
         tokenizer = _pipeline.tokenizer
         device = next(model.parameters()).device
 
-        if getattr(_pipeline, 'task', None) == 'text-classification':
-            # Classifier: logits are [batch, num_labels]; feed raw text
-            inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-            inputs = inputs.to(device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-                logits = outputs.logits  # [1, num_labels]
-            probs = torch.softmax(logits[0], dim=-1)
-            # Map id->label and build Positive/Negative (binary). Neutral set to 0.0
-            id2label = getattr(model.config, 'id2label', {i: str(i) for i in range(probs.shape[-1])})
-            prob_dict = {'Positive': 0.0, 'Negative': 0.0}
-            for idx, p in enumerate(probs.tolist()):
-                label = id2label.get(idx, '').lower()
-                if 'pos' in label:
-                    prob_dict['Positive'] += p
-                elif 'neg' in label:
-                    prob_dict['Negative'] += p
-            # Normalize to sum<=1 and add Neutral=0 for UI compatibility
-            s = prob_dict['Positive'] + prob_dict['Negative']
-            if s > 0:
-                prob_dict['Positive'] /= s
-                prob_dict['Negative'] /= s
-            prob_dict_full = {**prob_dict, 'Neutral': 0.0}
-            predicted_sentiment = 'Positive' if prob_dict['Positive'] >= prob_dict['Negative'] else 'Negative'
-            return predicted_sentiment, prob_dict_full
-        else:
-            # Decoder LM: use prompt and last-token logits trick
-            formatted_prompt = prompt.format(text=text)
-            inputs = tokenizer(formatted_prompt, return_tensors="pt")
-            inputs = inputs.to(device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-                logits = outputs.logits[0, -1, :]
-            # Use the first token-piece for each label; if missing, back off to substring search
-            def first_id(label: str):
-                ids = tokenizer.encode(label, add_special_tokens=False)
-                return ids[0] if ids else None
-            pos_id = first_id("Positive")
-            neg_id = first_id("Negative")
-            neu_id = first_id("Neutral")
-            positive_logit = logits[pos_id].item() if pos_id is not None else -float('inf')
-            negative_logit = logits[neg_id].item() if neg_id is not None else -float('inf')
-            neutral_logit = logits[neu_id].item() if neu_id is not None else -float('inf')
-            sentiment_logits = torch.tensor([positive_logit, negative_logit, neutral_logit], device=logits.device)
-            probabilities = torch.softmax(sentiment_logits, dim=0)
-            prob_dict = {
-                'Positive': probabilities[0].item(),
-                'Negative': probabilities[1].item(),
-                'Neutral': probabilities[2].item()
-            }
-            predicted_sentiment = max(prob_dict, key=prob_dict.get)
-            # Also provide raw generation to be shown in UI
-            try:
-                gen = _pipeline(formatted_prompt, max_new_tokens=8, do_sample=False)
-                raw_out = gen[0].get('generated_text', '')
-                # Trim the prompt prefix so UI shows only the model's continuation
-                raw_output = raw_out[len(formatted_prompt):].strip() if raw_out.startswith(formatted_prompt) else raw_out
-                # Only keep the first word as requested
-                raw_output = _take_first_word(raw_output)
-            except Exception:
-                raw_output = ''
-            return predicted_sentiment, {**prob_dict, '_raw_output': raw_output, '_prompt': formatted_prompt}
+        # Decoder LM: use prompt and last-token logits over our three labels
+        formatted_prompt = prompt.format(text=text)
+        inputs = tokenizer(formatted_prompt, return_tensors="pt")
+        inputs = inputs.to(device)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits[0, -1, :]
+
+        labels = ["Attention_needed", "Default", "Escalate"]
+        def first_id(label: str):
+            ids = tokenizer.encode(label, add_special_tokens=False)
+            return ids[0] if ids else None
+        ids = [first_id(lbl) for lbl in labels]
+        # If any id is None, assign -inf so it won't win
+        label_logits = [logits[i].item() if i is not None else -float('inf') for i in ids]
+        label_logits_t = torch.tensor(label_logits, device=logits.device)
+        probabilities = torch.softmax(label_logits_t, dim=0)
+        prob_dict = {labels[i]: float(probabilities[i].item()) for i in range(len(labels))}
+        predicted_label = max(prob_dict, key=prob_dict.get)
+        # Also provide a raw generation for UI debugging
+        try:
+            gen = _pipeline(formatted_prompt, max_new_tokens=8, do_sample=False)
+            raw_out = gen[0].get('generated_text', '')
+            raw_output = raw_out[len(formatted_prompt):].strip() if raw_out.startswith(formatted_prompt) else raw_out
+            raw_output = _take_first_word(raw_output)
+        except Exception:
+            raw_output = ''
+        return predicted_label, {**prob_dict, '_raw_output': raw_output, '_prompt': formatted_prompt}
         
     except Exception as e:
-        print(f"Error in sentiment prediction with distribution: {e}")
+        print(f"Error in classification prediction with distribution: {e}")
         # Fallback to simple generation
         try:
             formatted_prompt_local = prompt.format(text=text)
@@ -571,17 +671,20 @@ def predict_sentiment_with_distribution(text):
             # Take only the first line and then the first word
             first_line = sentiment_prediction.split('\n', 1)[0].strip()
             sentiment_first = _take_first_word(first_line)
-            
-            if 'Negative' in sentiment_first:
-                predicted = 'Negative'
-            elif 'Positive' in sentiment_first:
-                predicted = 'Positive'
+
+            s_low = sentiment_first.lower()
+            if 'escalate' in s_low:
+                predicted = 'Escalate'
+            elif 'attention' in s_low:
+                predicted = 'Attention_needed'
+            elif 'default' in s_low:
+                predicted = 'Default'
             else:
-                predicted = 'Neutral'
-            
-            # Return uniform probabilities as fallback
-            prob_dict = {'Positive': 0.33, 'Negative': 0.33, 'Neutral': 0.34}
-            prob_dict[predicted] = 0.7  # Give higher confidence to predicted class
+                predicted = 'Default'
+
+            # Return skewed probabilities as fallback
+            prob_dict = {'Attention_needed': 0.15, 'Default': 0.7, 'Escalate': 0.15}
+            prob_dict[predicted] = 0.7
             remaining = 0.15
             for key in prob_dict:
                 if key != predicted:
@@ -591,21 +694,15 @@ def predict_sentiment_with_distribution(text):
             
         except Exception as e2:
             print(f"Fallback also failed: {e2}")
-            return 'Neutral', {'Positive': 0.33, 'Negative': 0.33, 'Neutral': 0.34, '_raw_output': '', '_prompt': ''}
+            return 'Default', {'Attention_needed': 0.2, 'Default': 0.6, 'Escalate': 0.2, '_raw_output': '', '_prompt': ''}
 
 
 def predict_sentiment(text):
     """
-    Predict sentiment using the Gemma model with the defined prompt.
-    
-    Args:
-        text (str): The input email text to analyze
-        
-    Returns:
-        str: Predicted sentiment (Positive, Negative, or Neutral)
+    Backward-compat API: returns the predicted label string.
     """
-    sentiment, _ = predict_sentiment_with_distribution(text)
-    return sentiment
+    label, _ = predict_sentiment_with_distribution(text)
+    return label
 
 
 def get_attention(text):
@@ -626,31 +723,77 @@ def get_attention(text):
         # Load model and tokenizer
         model, tokenizer = load_model()
         
-        # Determine decision token index based on model type
-        # Encoder-only (e.g., BERT/DistilBERT): use [CLS] at index 0
-        # Decoder-only (e.g., GPT/Llama): use last token -1
-        try:
-            is_encoder_only = getattr(model.config, 'is_encoder_decoder', False) is False and getattr(model.config, 'model_type', '') in ['bert', 'distilbert', 'roberta']
-        except Exception:
-            is_encoder_only = False
-        decision_index = 0 if is_encoder_only else -1
+        # Always treat as decoder-only flow for attention visualization
+        decision_index = -1
 
         # Predict sentiment with probabilities using the prompt
         sentiment_prediction, probabilities = predict_sentiment_with_distribution(text)
         
         # For attention extraction, we'll use the formatted prompt to see what the model focuses on
         formatted_prompt = prompt.format(text=text)
-        
-        # Extract attention scores and offsets from the formatted prompt (per-token)
-        offsets, token_scores_dict = extract_attention_scores(model, tokenizer, formatted_prompt, decision_index=decision_index)
-        
-        # Identify the email substring span within the prompt
+
+        # Pre-tokenize to determine the email span and prefer decision token at last email token for decoder models
+        pre_enc = tokenizer(formatted_prompt, return_offsets_mapping=True, add_special_tokens=True)
+        pre_offsets = pre_enc.get("offset_mapping", [])
         start_marker = "I have the following email:"
         end_marker = "Categorize the email"
         s = formatted_prompt.find(start_marker)
         e = formatted_prompt.find(end_marker, s if s >= 0 else 0)
         email_start = (s + len(start_marker)) if s >= 0 else 0
         email_end = e if e >= 0 else len(formatted_prompt)
+        pre_token_indices = [i for i, (a, b) in enumerate(pre_offsets) if not (b <= email_start or a >= email_end)]
+        if pre_token_indices:
+            # Prefer the last non-whitespace, non-punctuation, non-special token in the email span
+            try:
+                import re
+                pre_input_ids = pre_enc.get("input_ids", [])
+                chosen = None
+                for idx in reversed(pre_token_indices):
+                    tid = pre_input_ids[idx] if isinstance(pre_input_ids, list) else None
+                    tok_text = tokenizer.decode([tid]) if isinstance(tid, int) else formatted_prompt[pre_offsets[idx][0]:pre_offsets[idx][1]]
+                    t = tok_text.strip()
+                    is_special = (t.startswith('[') and t.endswith(']')) or (t.startswith('<') and t.endswith('>'))
+                    is_ws = re.fullmatch(r"\s+", tok_text) is not None
+                    is_punct_only = re.fullmatch(r"\W+", t) is not None if t else True
+                    if not is_special and not is_ws and not is_punct_only:
+                        chosen = idx
+                        break
+                decision_index = chosen if chosen is not None else pre_token_indices[-1]
+            except Exception:
+                decision_index = pre_token_indices[-1]
+            if DEBUG_ATTENTION_LOGS:
+                try:
+                    da, db = pre_offsets[decision_index]
+                    dec_txt = formatted_prompt[da:db].replace("\n", "\\n")
+                    print(f"[decision_token] using last email token index={decision_index} text='{dec_txt}' span=({da},{db})")
+                except Exception:
+                    pass
+        
+        # Extract attention scores and offsets using decoder-only label-conditioned path
+        if DEBUG_ATTENTION_LOGS:
+            print("[extract_mode] decoder: using label-conditioned attention (predicted label)")
+        predicted_label = sentiment_prediction if isinstance(sentiment_prediction, str) else ''
+        raw_gen_label = probabilities.get('_raw_output', '').strip()
+        if DEBUG_ATTENTION_LOGS:
+            try:
+                print(f"[forced_label_source] predicted='{predicted_label}' raw_gen='{raw_gen_label}'")
+            except Exception:
+                pass
+        label_text = predicted_label if predicted_label else raw_gen_label
+        if label_text:
+            offsets, token_scores_dict = extract_forced_label_attention(model, tokenizer, formatted_prompt, label_text, email_start, email_end)
+        else:
+            offsets, token_scores_dict = extract_generated_label_attention(model, tokenizer, formatted_prompt, email_start, email_end)
+        if DEBUG_ATTENTION_LOGS:
+            try:
+                da, db = offsets[decision_index]
+                dec_txt = formatted_prompt[da:db].replace("\n","\\n")
+                print(f"[decision_token] index={decision_index} text='{dec_txt}' span=({da},{db})")
+            except Exception:
+                pass
+        
+        # Identify the email substring span within the prompt (reusing computed markers)
+        # start_marker/end_marker/email_start/email_end already computed above
 
         # Select token indices overlapping the email substring
         token_indices = [i for i, (a, b) in enumerate(offsets) if not (b <= email_start or a >= email_end)]
@@ -677,6 +820,8 @@ def get_attention(text):
                 la = np.array(token_scores_email['layer_average'])
                 ro = np.array(token_scores_email['rollout'])
                 print(f"[get_attention] email token score stats layer_avg(min={la.min():.4f} max={la.max():.4f}) rollout(min={ro.min():.4f} max={ro.max():.4f})")
+                label_tok = token_scores_dict.get('_generated_label_token', '')
+                print(f"[attention_source] decoder_label_token='{label_tok}' aggregated=True")
             except Exception:
                 pass
 
@@ -743,8 +888,12 @@ def get_attention(text):
                     toks = []
                     for idx, val in top:
                         a, b = clipped_offsets[idx]
-                        toks.append((email_text_only[a:b], float(val)))
-                    print(f"[top_tokens] {name}:", ", ".join([f"{t[0]}({t[1]:.2f})" for t in toks]))
+                        tok = email_text_only[a:b]
+                        cleaned = tok.strip()
+                        if cleaned == "":
+                            continue
+                        toks.append((tok.replace("\n", " "), float(val)))
+                    print(f"[top_tokens] {name}:", ", ".join([f"{t[0]}({t[1]:.4f})" for t in toks]))
                 preview_top(token_scores_email['rollout'], 'rollout')
                 preview_top(token_scores_email['layer_average'], 'layer_avg')
             except Exception:
@@ -759,15 +908,15 @@ def get_attention(text):
                 'offsets': clipped_offsets,
                 'layer_average': token_scores_email['layer_average'],
                 'rollout': token_scores_email['rollout'],
-                'text': email_text_only,
+                'text': text,
             },
             'sentence_attention': {
                 'spans': sentence_spans,
                 'layer_average': sentence_scores['layer_average'],
                 'rollout': sentence_scores['rollout'],
-                'text': email_text_only,
+                'text': text,
             },
-            'sentiment': sentiment_prediction,
+            'label': sentiment_prediction,
             'probabilities': probabilities,
             'confidence': max(v for k, v in probabilities.items() if not k.startswith('_')),
             'raw_model_output': probabilities.get('_raw_output', ''),

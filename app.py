@@ -1,12 +1,12 @@
 import streamlit as st
 from attention_model import get_attention
 
-# Configure page
+    # Configure page
 st.set_page_config(
-    page_title="LLM Attention Sentiment Analysis",
+    page_title="LLM Attention Classification Analysis",
     page_icon="🔍",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 # Custom CSS for better styling
@@ -146,15 +146,160 @@ def render_sentence_attention_html(text, spans, scores):
         html_parts.append(text[cursor:])
     return ''.join(html_parts)
 
+def compute_word_spans(text: str):
+    """
+    Return spans (start, end) for contiguous non-whitespace sequences in text.
+    Keeps the original text intact; spans map onto the same string.
+    """
+    import re
+    return [m.span() for m in re.finditer(r"\S+", text)]
+
+def aggregate_token_scores_to_spans(spans, token_offsets, token_scores):
+    """
+    Aggregate token scores onto arbitrary spans using overlap-sum, then min-max normalize.
+    """
+    if not spans or not token_offsets or not token_scores:
+        return []
+    agg = [0.0] * len(spans)
+    for (ta, tb), s in zip(token_offsets, token_scores):
+        for i, (sa, sb) in enumerate(spans):
+            if not (tb <= sa or ta >= sb):
+                agg[i] += float(s)
+    if agg:
+        mn, mx = min(agg), max(agg)
+        if mx > mn:
+            agg = [(x - mn) / (mx - mn) for x in agg]
+        else:
+            agg = [0.5 for _ in agg]
+    return agg
+
+def max_token_scores_to_spans(spans, token_offsets, raw_scores, norm_scores):
+    """
+    For each span, take the maximum token score among overlapping tokens.
+    Returns (norm_list, raw_list) aligned with spans.
+    """
+    norm_out = [0.0] * len(spans)
+    raw_out = [0.0] * len(spans)
+    if not spans or not token_offsets or not raw_scores:
+        return norm_out, raw_out
+    for i, (sa, sb) in enumerate(spans):
+        max_norm = 0.0
+        max_raw = 0.0
+        for (ta, tb), rs, ns in zip(token_offsets, raw_scores, norm_scores if norm_scores else raw_scores):
+            if not (tb <= sa or ta >= sb):
+                if ns > max_norm:
+                    max_norm = float(ns)
+                    max_raw = float(rs)
+        norm_out[i] = max_norm
+        raw_out[i] = max_raw
+    return norm_out, raw_out
+
+def render_span_attention_html(text, spans, scores, min_threshold: float = 0.0, raw_scores=None):
+    """
+    Highlight arbitrary spans with their scores. Overlap is not expected here;
+    spans should be non-overlapping and ordered.
+    """
+    if not spans or not scores or len(spans) != len(scores):
+        return text
+    html_parts = []
+    cursor = 0
+    # normalize already done by caller for scores; still guard for 0..1
+    s_min, s_max = min(scores), max(scores)
+    if s_max > s_min:
+        norm = [(s - s_min) / (s_max - s_min) for s in scores]
+    else:
+        norm = [0.5] * len(scores)
+    for (start, end), s in zip(spans, norm):
+        if start > cursor:
+            html_parts.append(text[cursor:start])
+        segment = text[start:end]
+        if s >= min_threshold:
+            intensity = int(255 * (1 - s * 0.8))
+            color = f"rgba(255, {intensity}, {intensity}, 0.9)"
+            title_val = s
+            if raw_scores and len(raw_scores) == len(spans):
+                try:
+                    title_val = float(raw_scores[spans.index((start, end))])
+                except Exception:
+                    title_val = s
+            html_parts.append(
+                f'<span style="background-color: {color}; color:#111; padding: 2px 3px; '
+                f'border-radius: 3px; margin: 0 1px; font-weight: {400 + int(s * 200)};" '
+                f'title="Attention: {title_val:.3f}">{segment}</span>'
+            )
+        else:
+            html_parts.append(segment)
+        cursor = end
+    if cursor < len(text):
+        html_parts.append(text[cursor:])
+    return ''.join(html_parts)
+
+def _build_inside_tag_mask(text: str):
+    """Return a boolean list per character: True if inside <...> HTML-like tag."""
+    inside = False
+    mask = []
+    for ch in text:
+        if ch == '<':
+            inside = True
+        mask.append(inside)
+        if ch == '>':
+            inside = False
+    return mask
+
+def _alpha_ratio(s: str) -> float:
+    if not s:
+        return 0.0
+    total = sum(1 for c in s if not c.isspace())
+    if total == 0:
+        return 0.0
+    alpha = sum(1 for c in s if c.isalpha())
+    return alpha / total
+
+def _is_structural_noise(segment: str) -> bool:
+    """Heuristic structural filter for UI-only suppression: tags/css/low-alpha and boilerplate labels."""
+    if not segment:
+        return True
+    s = segment.strip().lower()
+    if s in {"subject:", "description:", "subject", "description"}:
+        return True
+    if 'color' in s or 'rgb(' in s:
+        return True
+    return _alpha_ratio(s) < 0.4
+
 def main():
     # Main header
     st.markdown('<div class="main-header">', unsafe_allow_html=True)
-    st.title("🔍 LLM Attention Sentiment Analysis")
+    st.title("🔍 LLM Attention Classification Analysis")
     st.markdown('</div>', unsafe_allow_html=True)
 
     # Persist last analysis to allow method switching without recomputation
     if 'analysis' not in st.session_state:
         st.session_state.analysis = None
+
+    # Sidebar for attention visualization controls
+    with st.sidebar:
+        st.header("Visualization Controls")
+        
+        method = st.radio(
+            "Attention Method",
+            options=["Layer Average", "Rollout"],
+            horizontal=False,
+            index=1,
+            key="attention_method"
+        )
+        
+
+        aggregate_words = st.checkbox(
+            "Aggregate token attentions to words",
+            value=True,
+            help="When enabled, token scores are merged per word for display."
+        )
+        
+        # Percentage sliders for highlighting thresholds
+        if aggregate_words:
+            top_pct = st.slider("Top words (%)", 1, 100, 30, 1)
+        else:
+            top_pct = st.slider("Top tokens (%)", 1, 100, 20, 1)
 
     # Create three columns for layout
     left_col, center_col, right_col = st.columns([2, 1, 2])
@@ -205,128 +350,118 @@ def main():
                 st.info("Showing results for the previous input. Click 'Get Attention' to recompute for current text.")
 
         if result_data:
-            # Display prediction distribution
-            sentiment = result_data.get('sentiment', 'Unknown')
-            probabilities = result_data.get('probabilities', {})
-            raw_output = result_data.get('raw_model_output', '')
-            used_prompt = result_data.get('used_prompt', '')
-            if probabilities:
-                st.subheader("📊 Prediction Distribution")
-                st.write("Model's confidence for each sentiment category:")
-                col1, col2, col3 = st.columns(3)
-                colors = {'Positive': "#28a745", 'Negative': "#dc3545", 'Neutral': "#ffc107"}
-                for i, (sentiment_type, prob) in enumerate([
-                    ('Positive', probabilities.get('Positive', 0)),
-                    ('Negative', probabilities.get('Negative', 0)),
-                    ('Neutral', probabilities.get('Neutral', 0))
-                ]):
-                    col = [col1, col2, col3][i]
-                    with col:
-                        is_predicted = sentiment_type == sentiment
-                        border_style = f"border: 2px solid {colors[sentiment_type]};" if is_predicted else "border: 1px solid #ddd;"
-                        st.markdown(f'''
-                            <div style="text-align: center; padding: 10px; {border_style} 
-                                        border-radius: 8px; background-color: {colors[sentiment_type]}10;">
-                                <h4 style="margin: 0; color: {colors[sentiment_type]};">
-                                    {sentiment_type}
-                                </h4>
-                                <div style="font-size: 24px; font-weight: bold; color: {colors[sentiment_type]};">
-                                    {prob:.1%}
-                                </div>
-                                <div style="background-color: #f0f0f0; border-radius: 10px; height: 8px; margin: 8px 0;">
-                                    <div style="background-color: {colors[sentiment_type]}; height: 8px; 
-                                                border-radius: 10px; width: {prob*100}%;"></div>
-                                </div>
-                            </div>
-                        ''', unsafe_allow_html=True)
-
-            # Show raw model output and the prompt used
-            if raw_output:
-                st.subheader("🧪 Raw model output")
-                st.code(raw_output, language="text")
-            if used_prompt:
-                with st.expander("Show used prompt"):
-                    st.code(used_prompt, language="text")
-
-            # Display token/sentence attention with correct mapping
+            # Display token/sentence attention with correct mapping FIRST
             token_att = result_data.get('token_attention')
             if token_att:
-                st.subheader("🎯 Attention Visualization")
-                st.write("Token-level highlighting uses exact tokenizer offsets. Adjust the threshold to show only the most attended tokens.")
-                method = st.radio(
-                    "Method",
-                    options=["Layer Average", "Rollout"],
-                    horizontal=True,
-                    index=1,
-                    key="attention_method"
-                )
                 method_key = {"Layer Average": "layer_average", "Rollout": "rollout"}[method]
-
-                hide_noise = st.checkbox(
-                    "Hide punctuation and common stopwords",
-                    value=True,
-                    help="When enabled, punctuation and very common words are hidden from the top-tokens list."
-                )
 
                 text_to_show = token_att.get('text', '')
                 offsets = token_att.get('offsets', [])
                 scores = token_att.get(method_key, [])
 
-                # Normalize scores and compute percentile-based cutoff
-                cutoff = 1.0
-                norm_scores = []
-                if scores:
-                    s_min, s_max = min(scores), max(scores)
-                    norm_scores = [(s - s_min) / (s_max - s_min) if s_max > s_min else 0.5 for s in scores]
-                    top_pct = st.slider(
-                        "Top tokens (%)",
-                        min_value=1,
-                        max_value=100,
-                        value=20,
-                        step=1,
-                        help="Highlight the top X% tokens by normalized attention"
+                if not aggregate_words:
+                    # Token-level flow
+                    cutoff = 1.0
+                    norm_scores = []
+                    if scores:
+                        # Apply structural filtering to visualization: zero-out non-informative tokens
+                        inside_mask_chars = _build_inside_tag_mask(text_to_show)
+                        vis_scores = []
+                        for (start, end), s in zip(offsets, scores):
+                            seg = text_to_show[start:end]
+                            cleaned = seg.strip()
+                            inside_tag = any(inside_mask_chars[i] for i in range(start, min(end, len(inside_mask_chars))))
+                            vis_scores.append(0.0 if (inside_tag or _is_structural_noise(cleaned)) else float(s))
+                        s_min, s_max = min(vis_scores), max(vis_scores)
+                        norm_scores = [(s - s_min) / (s_max - s_min) if s_max > s_min else 0.5 for s in vis_scores]
+                        k = max(1, int(round(top_pct / 100.0 * len(norm_scores))))
+                        sorted_vals = sorted(norm_scores, reverse=True)
+                        cutoff = sorted_vals[k - 1] if k - 1 < len(sorted_vals) else sorted_vals[-1]
+                    highlighted_html = render_token_attention_html(text_to_show, offsets, vis_scores if scores else scores, min_threshold=cutoff)
+
+                    st.markdown(
+                        f'<div style="line-height: 1.8; font-size: 16px; padding: 15px; '
+                        f'background-color: #f8f9fa; color:#111; border-radius: 8px; margin: 10px 0; white-space: pre-wrap;">{highlighted_html}</div>',
+                        unsafe_allow_html=True
                     )
-                    k = max(1, int(round(top_pct / 100.0 * len(norm_scores))))
-                    sorted_vals = sorted(norm_scores, reverse=True)
-                    cutoff = sorted_vals[k - 1] if k - 1 < len(sorted_vals) else sorted_vals[-1]
-                highlighted_html = render_token_attention_html(text_to_show, offsets, scores, min_threshold=cutoff)
+                else:
+                    # Word-aggregated flow
+                    word_spans = compute_word_spans(text_to_show)
+                    # Precompute token norm for consistent thresholding
+                    norm_scores = []
+                    if scores:
+                        s_min, s_max = min(scores), max(scores)
+                        norm_scores = [(s - s_min) / (s_max - s_min) if s_max > s_min else 0.5 for s in scores]
+                    # Structural filtering at token level BEFORE aggregation
+                    inside_mask_chars = _build_inside_tag_mask(text_to_show)
+                    filtered_token_scores = []
+                    for (start, end), s in zip(offsets, scores):
+                        seg = text_to_show[start:end]
+                        cleaned = seg.strip()
+                        inside_tag = any(inside_mask_chars[i] for i in range(start, min(end, len(inside_mask_chars))))
+                        filtered_token_scores.append(0.0 if (inside_tag or _is_structural_noise(cleaned)) else float(s))
+                    # Aggregate by sum using filtered tokens
+                    word_scores = aggregate_token_scores_to_spans(word_spans, offsets, filtered_token_scores)
+                    # Percentile cutoff on words
+                    cutoff = 1.0
+                    if word_scores:
+                        ws_sorted = sorted(word_scores, reverse=True)
+                        k = max(1, int(round(top_pct / 100.0 * len(ws_sorted))))
+                        cutoff = ws_sorted[k - 1] if k - 1 < len(ws_sorted) else ws_sorted[-1]
+                    # Structural filtering on display as well
+                    inside_mask = _build_inside_tag_mask(text_to_show)
+                    filtered_spans = []
+                    filtered_scores = []
+                    for (a, b), s in zip(word_spans, word_scores):
+                        seg = text_to_show[a:b]
+                        inside_tag = any(inside_mask[i] for i in range(a, min(b, len(inside_mask))))
+                        if inside_tag or _is_structural_noise(seg):
+                            continue
+                        filtered_spans.append((a, b))
+                        filtered_scores.append(s)
+                    highlighted_html = render_span_attention_html(
+                        text_to_show,
+                        filtered_spans if filtered_spans else word_spans,
+                        filtered_scores if filtered_scores else word_scores,
+                        min_threshold=cutoff
+                    )
+                    st.markdown(
+                        f'<div style="line-height: 1.8; font-size: 16px; padding: 15px; '
+                        f'background-color: #f8f9fa; color:#111; border-radius: 8px; margin: 10px 0; white-space: pre-wrap;">{highlighted_html}</div>',
+                        unsafe_allow_html=True
+                    )
 
-                st.markdown(
-                    f'<div style="line-height: 1.8; font-size: 16px; padding: 15px; '
-                    f'background-color: #f8f9fa; color:#111; border-radius: 8px; margin: 10px 0; white-space: pre-wrap;">{highlighted_html}</div>',
-                    unsafe_allow_html=True
-                )
-
-                # Show top tokens above threshold
-                st.subheader("🔝 Highest-attended tokens")
-                # Use the same percentile-based cutoff for listing top tokens
-                if scores:
-                    top = []
-                    # Basic English stopword list (lightweight, no extra deps)
-                    stopwords = {
-                        'the','is','am','are','was','were','be','been','being','a','an','and','or','but','if','then','so','to','of','in','on','for','with','by','from','as','at','this','that','these','those','it','its','your','you','yours','we','our','ours','they','their','theirs','he','him','his','she','her','hers','i','me','my','mine','do','does','did','have','has','had','will','would','can','could','should','shall','may','might','there','here','hi','hello','thanks'
-                    }
-                    import re
-                    for (start, end), s_norm, s_raw in zip(offsets, norm_scores, scores):
-                        if s_norm >= cutoff:
-                            tok_text = text_to_show[start:end]
-                            cleaned = tok_text.strip()
-                            is_punct_only = len(cleaned) > 0 and re.fullmatch(r"\W+", cleaned) is not None
-                            is_stop = cleaned.lower() in stopwords
-                            if hide_noise and (is_punct_only or is_stop):
-                                continue
-                            top.append((tok_text, s_norm, s_raw))
-                    top.sort(key=lambda t: t[1], reverse=True)
-                    if top:
-                        chips = " ".join(
-                            [
-                                f'<span style="background:#eef;color:#111;border:1px solid #ccd;padding:2px 6px;border-radius:12px;margin:2px;display:inline-block;">{tok} <span style="opacity:0.7">({s:.2f})</span></span>'
-                                for tok, s, _ in top[:25]
-                            ]
-                        )
-                        st.markdown(f'<div style="padding: 4px 0;">{chips}</div>', unsafe_allow_html=True)
-                    else:
-                        st.write("No tokens above current threshold.")
+            # Display prediction distribution AFTER attention visualization
+            label = result_data.get('label', 'Unknown')
+            probabilities = result_data.get('probabilities', {})
+            if probabilities:
+                st.write("Model's confidence for each label:")
+                col1, col2, col3 = st.columns(3)
+                colors = {'Attention_needed': "#ff7f0e", 'Default': "#1f77b4", 'Escalate': "#d62728"}
+                for i, (lbl, prob) in enumerate([
+                    ('Attention_needed', probabilities.get('Attention_needed', 0)),
+                    ('Default', probabilities.get('Default', 0)),
+                    ('Escalate', probabilities.get('Escalate', 0))
+                ]):
+                    col = [col1, col2, col3][i]
+                    with col:
+                        is_predicted = lbl == label
+                        border_style = f"border: 2px solid {colors[lbl]};" if is_predicted else "border: 1px solid #ddd;"
+                        st.markdown(f'''
+                            <div style="text-align: center; padding: 10px; {border_style} 
+                                        border-radius: 8px; background-color: {colors[lbl]}10;">
+                                <h4 style="margin: 0; color: {colors[lbl]};">
+                                    {lbl}
+                                </h4>
+                                <div style="font-size: 24px; font-weight: bold; color: {colors[lbl]};">
+                                    {prob:.1%}
+                                </div>
+                                <div style="background-color: #f0f0f0; border-radius: 10px; height: 8px; margin: 8px 0;">
+                                    <div style="background-color: {colors[lbl]}; height: 8px; 
+                                                border-radius: 10px; width: {prob*100}%;"></div>
+                                </div>
+                            </div>
+                        ''', unsafe_allow_html=True)
                 
         elif analyze_button and not email_text.strip():
             st.error("Please enter some email text to analyze.")
